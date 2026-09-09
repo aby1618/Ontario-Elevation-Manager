@@ -1,0 +1,13 @@
+author=Abhijeet Patel
+email=abhijeetpatel1618@gmail.com
+
+homepage=https://github.com/aby1618/Ontario-Elevation-Manager
+repository=https://github.com/aby1618/Ontario-Elevation-Manager
+tracker=https://github.com/aby1618/Ontario-Elevation-Manager/issues
+
+license=MIT
+
+tags=Ontario,elevation,lidar,terrain,DTM,DSM,raster,GeoHub
+
+qgisMinimumVersion=3.44.0
+qgisMaximumVersion=3.99.0
