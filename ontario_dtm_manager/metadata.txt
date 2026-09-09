@@ -1,0 +1,12 @@
+[general]
+name=Ontario Elevation Manager
+description=Download, cache, manage and export native Ontario LiDAR-derived DTM and DSM raster tiles.
+about=QGIS 3.44 plugin for native Ontario LiDAR-derived elevation rasters. Version 1.0 provides the complete 1 km tile/package workflow for LiDAR DTM and LiDAR DSM, including flexible AOI selection, selective source-package download/extraction, shared or project-specific caching, VRT lifecycle management, cache cleanup, polygon clipping, GeoTIFF/COG delivery, and a responsive compact interface.
+version=1.0.2
+qgisMinimumVersion=3.44.0
+author=Ontario Elevation Manager Project
+category=Raster
+experimental=False
+deprecated=False
+hasProcessingProvider=False
+icon=icon.png
