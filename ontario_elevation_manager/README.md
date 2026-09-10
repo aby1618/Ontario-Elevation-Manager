@@ -1,4 +1,4 @@
-# Ontario Elevation Manager — v1.0.1
+# Ontario Elevation Manager — v1.0.3
 
 Ontario Elevation Manager is a QGIS 3.44 plugin for working with the native Ontario LiDAR-derived **DTM** and **DSM** products without manually locating dozens of 1 km raster tiles inside large provincial packages.
 
