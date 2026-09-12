@@ -1,5 +1,6 @@
 from contextlib import suppress
 import os
+import re
 import shutil
 import zipfile
 from datetime import datetime
@@ -10,15 +11,24 @@ from qgis.PyQt.QtCore import (
     Qt,
     QSettings,
     QUrl,
+    QMetaType,
+    QTimer,
 )
 from qgis.PyQt.QtGui import (
     QIcon,
     QColor,
     QDesktopServices,
 )
+
+try:
+    # Qt 6 / QGIS 4 location
+    from qgis.PyQt.QtGui import QAction
+except ImportError:
+    # Qt 5 / QGIS 3 location
+    from qgis.PyQt.QtWidgets import QAction
 from qgis.PyQt.QtWidgets import (
-    QAction,
     QApplication,
+    QAbstractItemView,
     QCheckBox,
     QButtonGroup,
     QComboBox,
@@ -29,6 +39,7 @@ from qgis.PyQt.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QGroupBox,
+    QHeaderView,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -38,6 +49,8 @@ from qgis.PyQt.QtWidgets import (
     QPushButton,
     QRadioButton,
     QScrollArea,
+    QTableWidget,
+    QTableWidgetItem,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
@@ -66,7 +79,6 @@ from qgis.core import (
     Qgis,
 )
 
-from qgis.PyQt.QtCore import QVariant
 from qgis.gui import QgsRubberBand
 
 from .maptools import PolygonAOITool
@@ -74,10 +86,12 @@ from .services import (
     query_tiles_by_envelope,
     ensure_local_tile_index,
     resolve_package_jobs,
+    create_manual_package_job,
     get_package_metadata,
 )
 from .tasks import (
     OntarioDTMDownloadTask,
+    RasterQAError,
     build_vrt,
     OUTPUT_NODATA,
 )
@@ -532,6 +546,69 @@ class OntarioDTMDock(QDockWidget):
             selection_group
         )
 
+        self.source_project_widget = QWidget()
+        source_project_layout = QVBoxLayout(
+            self.source_project_widget
+        )
+        source_project_layout.setContentsMargins(0, 0, 0, 0)
+        source_project_layout.setSpacing(4)
+
+        source_project_row = QHBoxLayout()
+        source_project_row.setContentsMargins(0, 0, 0, 0)
+        source_project_row.setSpacing(4)
+        source_project_row.addWidget(QLabel("Source dataset:"))
+
+        self.source_project_combo = QComboBox()
+        self.source_project_combo.setMinimumWidth(0)
+        self.source_project_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.source_project_combo.setMinimumContentsLength(12)
+        self.source_project_combo.currentIndexChanged.connect(
+            plugin.source_project_changed
+        )
+        source_project_row.addWidget(
+            self.source_project_combo,
+            1,
+        )
+        source_project_row.addWidget(
+            HelpButton(
+                "Ontario elevation coverage can overlap between independent "
+                "LiDAR acquisition projects. Each source dataset is kept "
+                "separate: tile selection, downloads and VRTs are never mixed "
+                "between source projects. Use this list to review/edit the "
+                "currently displayed source dataset."
+            )
+        )
+        source_project_layout.addLayout(source_project_row)
+
+        self.source_project_summary_label = QLabel()
+        self.source_project_summary_label.setWordWrap(True)
+        self.source_project_summary_label.setStyleSheet(
+            "QLabel { color: palette(mid); }"
+        )
+        source_project_layout.addWidget(
+            self.source_project_summary_label
+        )
+
+        self.choose_source_projects_button = QPushButton(
+            "Choose Source Dataset(s)..."
+        )
+        self.choose_source_projects_button.clicked.connect(
+            plugin.choose_source_projects_again
+        )
+        self.choose_source_projects_button.setToolTip(
+            "Reopen the source-dataset selection dialog for the current AOI."
+        )
+        source_project_layout.addWidget(
+            self.choose_source_projects_button
+        )
+
+        self.source_project_widget.hide()
+        selection_layout.addWidget(
+            self.source_project_widget
+        )
+
         self.available_label = QLabel(
             "Available tiles: 0"
         )
@@ -544,12 +621,20 @@ class OntarioDTMDock(QDockWidget):
         self.missing_label = QLabel(
             "Need download: 0"
         )
+        self.issue_label = QLabel(
+            "Package issues: 0"
+        )
+        self.issue_label.setStyleSheet(
+            "QLabel { color: #b00020; font-weight: 600; }"
+        )
+        self.issue_label.hide()
 
         for label in (
             self.available_label,
             self.selected_label,
             self.cached_label,
             self.missing_label,
+            self.issue_label,
         ):
             label.setWordWrap(True)
             selection_layout.addWidget(label)
@@ -1427,6 +1512,227 @@ class OntarioDTMDock(QDockWidget):
             scroll
         )
 
+
+class SourceDatasetSelectionDialog(QDialog):
+    """Choose one or more independent LiDAR acquisition datasets for an AOI."""
+
+    def __init__(
+        self,
+        parent,
+        summaries,
+        dataset_short_name,
+        preselected=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle(
+            f"Select Ontario {dataset_short_name} Source Dataset(s)"
+        )
+        self.setModal(True)
+        self.resize(900, 380)
+
+        self.summaries = list(summaries)
+        self.preselected = set(preselected or [])
+
+        layout = QVBoxLayout(self)
+
+        intro = QLabel(
+            "Multiple independent LiDAR acquisition datasets overlap this area. "
+            "Select one or more source datasets. Each selected source is kept "
+            "separate and will produce its own VRT; tiles from different source "
+            "datasets are never merged into one terrain."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        hint = QLabel(
+            "The newest identifiable acquisition is preselected for convenience, "
+            "not as an engineering recommendation. Review the year/vintage, "
+            "resolution and vertical datum before choosing. '--' means the "
+            "available Ontario metadata does not expose that detail."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("QLabel { color: palette(mid); }")
+        layout.addWidget(hint)
+
+        self.table = QTableWidget(
+            len(self.summaries),
+            8,
+            self,
+        )
+        self.table.setHorizontalHeaderLabels(
+            [
+                "Use",
+                "Source dataset / project",
+                "Year / vintage",
+                "Resolution",
+                "Vertical datum",
+                "Tiles",
+                "Packages",
+                "Format",
+            ]
+        )
+        self.table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.table.setAlternatingRowColors(True)
+
+        latest_project = ""
+        if self.summaries:
+            latest_project = max(
+                self.summaries,
+                key=lambda item: (
+                    item.get("latest_year") or -1,
+                    item.get("project", ""),
+                ),
+            ).get("project", "")
+
+        for row, summary in enumerate(self.summaries):
+            project = summary["project"]
+
+            use_item = QTableWidgetItem()
+            use_item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsUserCheckable
+                | Qt.ItemFlag.ItemIsSelectable
+            )
+            checked = (
+                project in self.preselected
+                if self.preselected
+                else project == latest_project
+            )
+            use_item.setCheckState(
+                Qt.CheckState.Checked
+                if checked
+                else Qt.CheckState.Unchecked
+            )
+            use_item.setData(
+                Qt.ItemDataRole.UserRole,
+                project,
+            )
+            self.table.setItem(row, 0, use_item)
+
+            project_item = QTableWidgetItem(project)
+            project_item.setToolTip(
+                summary.get("details_tooltip", "")
+            )
+            self.table.setItem(row, 1, project_item)
+
+            self.table.setItem(
+                row,
+                2,
+                QTableWidgetItem(
+                    summary.get("year_label") or "--"
+                ),
+            )
+            self.table.setItem(
+                row,
+                3,
+                QTableWidgetItem(
+                    summary.get("resolution_label") or "--"
+                ),
+            )
+            self.table.setItem(
+                row,
+                4,
+                QTableWidgetItem(
+                    summary.get("vertical_datum_label") or "--"
+                ),
+            )
+            self.table.setItem(
+                row,
+                5,
+                QTableWidgetItem(str(summary.get("tile_count", 0))),
+            )
+            self.table.setItem(
+                row,
+                6,
+                QTableWidgetItem(str(summary.get("package_count", 0))),
+            )
+            self.table.setItem(
+                row,
+                7,
+                QTableWidgetItem(
+                    summary.get("format_label") or "--"
+                ),
+            )
+
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(
+            0,
+            QHeaderView.ResizeMode.ResizeToContents,
+        )
+        header.setSectionResizeMode(
+            1,
+            QHeaderView.ResizeMode.Stretch,
+        )
+        for column in range(2, 8):
+            header.setSectionResizeMode(
+                column,
+                QHeaderView.ResizeMode.ResizeToContents,
+            )
+
+        self.table.verticalHeader().setVisible(False)
+        layout.addWidget(self.table, 1)
+
+        selection_row = QHBoxLayout()
+        select_all = QPushButton("Select All")
+        clear_all = QPushButton("Clear")
+        select_all.clicked.connect(self._select_all)
+        clear_all.clicked.connect(self._clear_all)
+        selection_row.addWidget(select_all)
+        selection_row.addWidget(clear_all)
+        selection_row.addStretch(1)
+        layout.addLayout(selection_row)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._accept_checked)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _select_all(self):
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item is not None:
+                item.setCheckState(Qt.CheckState.Checked)
+
+    def _clear_all(self):
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item is not None:
+                item.setCheckState(Qt.CheckState.Unchecked)
+
+    def selected_projects(self):
+        projects = []
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if (
+                item is not None
+                and item.checkState() == Qt.CheckState.Checked
+            ):
+                projects.append(
+                    str(item.data(Qt.ItemDataRole.UserRole))
+                )
+        return projects
+
+    def _accept_checked(self):
+        if not self.selected_projects():
+            QMessageBox.warning(
+                self,
+                "Select a Source Dataset",
+                "Select at least one source dataset before continuing.",
+            )
+            return
+        self.accept()
+
 class CacheCleanupDialog(QDialog):
     def __init__(
         self,
@@ -1618,8 +1924,27 @@ class OntarioDTMManagerPlugin:
         self.custom_output_folder = ""
         self.export_task = None
         self._package_metadata_cache = {}
+        self.package_url_overrides = {}
         self.active_dataset_key = "lidar_dtm"
         self.dataset_terrain_names = {}
+
+        # Source-acquisition state. Ontario elevation coverage can overlap
+        # between independent LiDAR acquisition projects. Only one source
+        # project is displayed/editable at a time, while selected projects are
+        # retained separately for optional batch VRT creation.
+        self.all_source_project_records = {}
+        self.source_project_summaries = {}
+        self.selected_source_projects = []
+        self.source_project_selected_files = {}
+        self.source_project_issue_messages = {}
+        self.source_project_terrain_names = {}
+        self.source_project_base_terrain_name = ""
+        self.current_source_project = ""
+        self.source_query_aoi_geometry = None
+        self.source_query_had_multiple = False
+        self._switching_source_project = False
+        self._batch_build_state = None
+        self._batch_item_succeeded = False
 
         # V1 AOI polygon source. Exactly one project layer or external vector
         # source can be active at a time.
@@ -1871,10 +2196,10 @@ class OntarioDTMManagerPlugin:
                 self.update_vrt_path()
                 self.update_export_defaults(force_name=True)
 
-                # Tile selection belongs to one source dataset. Remove only the
-                # temporary tile-index layer when switching; completed terrain
-                # layers/VRTs remain in the project.
-                self._remove_all_available_tile_layers()
+                # Tile selection and source-acquisition choices belong to one
+                # elevation product. Clear only the temporary tile/source state
+                # when switching; completed terrain layers/VRTs remain.
+                self._reset_source_project_state(remove_layer=True)
             elif not self.dock.terrain_name_edit.text().strip():
                 self.dock.terrain_name_edit.setText(
                     self._default_terrain_name()
@@ -3259,9 +3584,24 @@ class OntarioDTMManagerPlugin:
         self.update_export_defaults()
 
     def use_project_defaults(self):
-        self.dock.terrain_name_edit.setText(
-            self._default_terrain_name()
-        )
+        base_name = self._default_terrain_name()
+        if self.current_source_project and self.source_query_had_multiple:
+            self.source_project_base_terrain_name = base_name
+            self._write_project_entry(
+                f"sourceBaseTerrainName_{self._selected_dataset_key()}",
+                base_name,
+            )
+            terrain_name = self._terrain_name_for_source_project(
+                base_name,
+                self.current_source_project,
+            )
+            self.source_project_terrain_names[
+                self.current_source_project
+            ] = terrain_name
+        else:
+            terrain_name = base_name
+
+        self.dock.terrain_name_edit.setText(terrain_name)
         self.dock.project_output_checkbox.setChecked(True)
         self.refresh_output_controls()
         self.update_export_defaults(force_name=True)
@@ -3278,6 +3618,11 @@ class OntarioDTMManagerPlugin:
             self.dock.terrain_name_edit.text()
         )
         self.dock.terrain_name_edit.setText(clean_name)
+
+        if self.current_source_project:
+            self.source_project_terrain_names[
+                self.current_source_project
+            ] = clean_name
 
         if not self.dock.project_output_checkbox.isChecked():
             output_folder = self.dock.output_edit.text().strip()
@@ -3852,6 +4197,514 @@ class OntarioDTMManagerPlugin:
         return geometry
 
     # --------------------------------------------------------
+    # SOURCE ACQUISITION DATASETS
+    # --------------------------------------------------------
+    def _reset_source_project_state(self, remove_layer=False):
+        self.all_source_project_records = {}
+        self.source_project_summaries = {}
+        self.selected_source_projects = []
+        self.source_project_selected_files = {}
+        self.source_project_issue_messages = {}
+        self.source_project_terrain_names = {}
+        self.source_project_base_terrain_name = ""
+        self.current_source_project = ""
+        self.source_query_aoi_geometry = None
+        self.source_query_had_multiple = False
+        self._batch_build_state = None
+        self._batch_item_succeeded = False
+
+        if self.dock:
+            self.dock.source_project_combo.blockSignals(True)
+            self.dock.source_project_combo.clear()
+            self.dock.source_project_combo.blockSignals(False)
+            self.dock.source_project_summary_label.clear()
+            self.dock.source_project_widget.hide()
+
+        if remove_layer:
+            self._remove_all_available_tile_layers()
+
+    def _record_geometry(self, item):
+        if item.get("qgs_geometry") is not None:
+            return QgsGeometry(item["qgs_geometry"])
+
+        rings = item.get("geometry", {}).get("rings", [])
+        if not rings:
+            return None
+
+        # ArcGIS polygons may contain multiple rings. Preserve every ring as a
+        # separate polygon ring instead of silently discarding all but the first.
+        polygons = []
+        for ring in rings:
+            points = [
+                QgsPointXY(float(x), float(y))
+                for x, y in ring
+            ]
+            if points:
+                polygons.append(points)
+
+        if not polygons:
+            return None
+
+        return QgsGeometry.fromPolygonXY(polygons)
+
+    def _records_intersecting_aoi(self, records, aoi_geometry):
+        filtered = []
+        for item in records:
+            geometry = self._record_geometry(item)
+            if geometry is None or geometry.isNull() or geometry.isEmpty():
+                continue
+            if geometry.intersects(aoi_geometry):
+                copied = dict(item)
+                copied["qgs_geometry"] = QgsGeometry(geometry)
+                filtered.append(copied)
+        return filtered
+
+    def _year_values_from_text(self, value):
+        text = str(value or "")
+        years = {
+            int(match)
+            for match in re.findall(r"(?<!\d)(?:19|20)\d{2}(?!\d)", text)
+        }
+
+        for match in re.finditer(
+            r"((?:19|20)\d{2})\s*[-–]\s*(\d{2})(?!\d)",
+            text,
+        ):
+            first = int(match.group(1))
+            short = int(match.group(2))
+            century = (first // 100) * 100
+            second = century + short
+            if second < first:
+                second += 100
+            years.add(first)
+            years.add(second)
+
+        return years
+
+    def _year_label(self, years):
+        values = sorted(set(years))
+        if not values:
+            return "--"
+        if len(values) == 1:
+            return str(values[0])
+        if values == list(range(values[0], values[-1] + 1)):
+            return f"{values[0]}–{values[-1]}"
+        return ", ".join(str(value) for value in values)
+
+    def _format_resolution_value(self, value):
+        if value in (None, ""):
+            return None
+        try:
+            numeric = float(value)
+            return f"{numeric:g} m"
+        except (TypeError, ValueError):
+            text = str(value).strip()
+            if not text:
+                return None
+            return text if "m" in text.lower() else text + " m"
+
+    def _source_project_summaries_from_records(self, records):
+        grouped = {}
+        for item in records:
+            attributes = item.get("attributes", {})
+            project = str(attributes.get("Project") or "Unspecified source project")
+            grouped.setdefault(project, []).append(item)
+
+        summaries = []
+
+        for project, project_records in grouped.items():
+            packages = sorted(
+                {
+                    str(item.get("attributes", {}).get("Package") or "")
+                    for item in project_records
+                    if str(item.get("attributes", {}).get("Package") or "")
+                }
+            )
+            extensions = sorted(
+                {
+                    os.path.splitext(
+                        str(item.get("attributes", {}).get("FileName") or "")
+                    )[1].lower().lstrip(".")
+                    for item in project_records
+                    if os.path.splitext(
+                        str(item.get("attributes", {}).get("FileName") or "")
+                    )[1]
+                }
+            )
+
+            resolutions = set()
+            vertical_datums = set()
+            vintage_strings = set()
+            inferred_years = set(self._year_values_from_text(project))
+            for package in packages:
+                inferred_years.update(self._year_values_from_text(package))
+            metadata_years = set()
+
+            metadata_failures = 0
+            use_package_metadata = (
+                self._selected_raster_dataset().get("package_mode")
+                == "feature_service"
+            )
+
+            if use_package_metadata:
+                for package in packages[:3]:
+                    metadata_failed = False
+                    try:
+                        metadata = get_package_metadata(
+                            project,
+                            package,
+                            self._selected_dataset_key(),
+                            resolve_download=False,
+                        )
+                    except (RuntimeError, ValueError, OSError):
+                        metadata_failures += 1
+                        metadata_failed = True
+                        metadata = None
+
+                    if not metadata:
+                        if not metadata_failed:
+                            metadata_failures += 1
+                    else:
+                        resolution = self._format_resolution_value(
+                            metadata.get("Resolution")
+                        )
+                        if resolution:
+                            resolutions.add(resolution)
+
+                        vertical = str(
+                            metadata.get("VerticalDatum") or ""
+                        ).strip()
+                        if vertical:
+                            vertical_datums.add(vertical)
+
+                        vintage = str(metadata.get("Vintage") or "").strip()
+                        if vintage:
+                            vintage_strings.add(vintage)
+                            metadata_years.update(
+                                self._year_values_from_text(vintage)
+                            )
+
+                    if resolutions and vintage_strings and vertical_datums:
+                        break
+
+            years = metadata_years or inferred_years
+            year_label = self._year_label(years)
+            resolution_label = (
+                "; ".join(sorted(resolutions))
+                if resolutions
+                else "--"
+            )
+            vertical_datum_label = (
+                "; ".join(sorted(vertical_datums))
+                if vertical_datums
+                else "--"
+            )
+            format_label = (
+                "/".join(extension.upper() for extension in extensions)
+                if extensions
+                else "--"
+            )
+
+            details = [
+                f"Source project: {project}",
+                f"Tiles intersecting AOI: {len(project_records)}",
+                f"Packages intersecting AOI: {len(packages)}",
+                f"Year / vintage: {year_label}",
+                f"Resolution: {resolution_label}",
+                f"Vertical datum: {vertical_datum_label}",
+                f"Raster format: {format_label}",
+            ]
+            if vintage_strings:
+                details.append(
+                    "Ontario vintage metadata: "
+                    + "; ".join(sorted(vintage_strings))
+                )
+            if metadata_failures:
+                details.append(
+                    f"Metadata unavailable for {metadata_failures} inspected package(s)."
+                )
+
+            summaries.append(
+                {
+                    "project": project,
+                    "tile_count": len(project_records),
+                    "package_count": len(packages),
+                    "packages": packages,
+                    "year_label": year_label,
+                    "latest_year": max(years) if years else None,
+                    "resolution_label": resolution_label,
+                    "vertical_datum_label": vertical_datum_label,
+                    "format_label": format_label,
+                    "details_tooltip": "\n".join(details),
+                }
+            )
+
+        return sorted(
+            summaries,
+            key=lambda item: (
+                -(item.get("latest_year") or -1),
+                item.get("project", "").lower(),
+            ),
+        )
+
+    def _source_project_slug(self, project_name):
+        slug = re.sub(
+            r"[^A-Za-z0-9]+",
+            "_",
+            str(project_name or "source").strip(),
+        ).strip("_")
+        return slug[:70] or "source"
+
+    def _base_terrain_name_for_source_query(self, overlapping=None):
+        current = self._sanitize_terrain_name(
+            self.dock.terrain_name_edit.text()
+        )
+        if (
+            self.current_source_project
+            and self.source_project_base_terrain_name
+            and self.source_project_terrain_names.get(
+                self.current_source_project
+            ) == current
+        ):
+            return self.source_project_base_terrain_name
+
+        saved_base = self._read_project_entry(
+            f"sourceBaseTerrainName_{self._selected_dataset_key()}",
+            "",
+        ).strip()
+        if overlapping is None:
+            overlapping = bool(self.source_query_had_multiple)
+        if saved_base and overlapping and "__" in current:
+            return self._sanitize_terrain_name(saved_base)
+
+        return current
+
+    def _terrain_name_for_source_project(self, base_name, project_name):
+        if not self.source_query_had_multiple:
+            return self._sanitize_terrain_name(base_name)
+        return self._sanitize_terrain_name(
+            f"{base_name}__{self._source_project_slug(project_name)}"
+        )
+
+    def _save_current_source_state(self):
+        project = self.current_source_project
+        layer = self._current_tile_layer()
+        if not project or not layer:
+            return
+
+        self.source_project_selected_files[project] = {
+            str(feature["FileName"])
+            for feature in layer.selectedFeatures()
+        }
+
+        issue_messages = {}
+        if layer.fields().indexOf("PackageIssue") >= 0:
+            for feature in layer.getFeatures():
+                if int(feature["PackageIssue"] or 0) == 1:
+                    issue_messages[str(feature["FileName"])] = str(
+                        feature["IssueMessage"] or "Package resolution issue"
+                    )
+        self.source_project_issue_messages[project] = issue_messages
+
+        terrain_name = self._sanitize_terrain_name(
+            self.dock.terrain_name_edit.text()
+        )
+        if terrain_name:
+            self.source_project_terrain_names[project] = terrain_name
+
+    def _tile_selection_changed(self, *args):
+        if not self._switching_source_project:
+            self._save_current_source_state()
+        self.update_counts()
+
+    def _source_summary_text(self, project):
+        summary = self.source_project_summaries.get(project, {})
+        pieces = []
+        if summary.get("year_label") and summary.get("year_label") != "--":
+            pieces.append(summary["year_label"])
+        if summary.get("resolution_label") and summary.get("resolution_label") != "--":
+            pieces.append(summary["resolution_label"])
+        pieces.append(f"{summary.get('tile_count', 0)} tile(s)")
+        pieces.append(f"{summary.get('package_count', 0)} package(s)")
+        if summary.get("format_label") and summary.get("format_label") != "--":
+            pieces.append(summary["format_label"])
+        return " | ".join(pieces)
+
+    def _populate_source_project_combo(self, selected_projects):
+        self.dock.source_project_combo.blockSignals(True)
+        self.dock.source_project_combo.clear()
+
+        for project in selected_projects:
+            summary = self.source_project_summaries.get(project, {})
+            display = project
+            self.dock.source_project_combo.addItem(display, project)
+            index = self.dock.source_project_combo.count() - 1
+            self.dock.source_project_combo.setItemData(
+                index,
+                summary.get("details_tooltip", ""),
+                Qt.ItemDataRole.ToolTipRole,
+            )
+
+        self.dock.source_project_combo.blockSignals(False)
+        self.dock.source_project_widget.setVisible(bool(selected_projects))
+        self.dock.choose_source_projects_button.setVisible(
+            len(self.all_source_project_records) > 1
+        )
+
+    def _show_source_project(self, project, save_previous=True):
+        if project not in self.all_source_project_records:
+            return
+
+        if save_previous:
+            self._save_current_source_state()
+
+        self._switching_source_project = True
+        try:
+            self.current_source_project = project
+
+            records = self.all_source_project_records[project]
+            aoi_geometry = self.source_query_aoi_geometry
+            if aoi_geometry is None:
+                return
+
+            terrain_name = self.source_project_terrain_names.get(project)
+            if terrain_name:
+                self.dock.terrain_name_edit.setText(terrain_name)
+                self.update_vrt_path()
+
+            self._create_tile_layer(
+                records,
+                aoi_geometry,
+            )
+
+            layer = self._current_tile_layer()
+            selected_files = self.source_project_selected_files.get(
+                project,
+                set(),
+            )
+            if layer and selected_files:
+                ids = [
+                    feature.id()
+                    for feature in layer.getFeatures()
+                    if str(feature["FileName"]) in selected_files
+                ]
+                if ids:
+                    layer.select(ids)
+
+            summary = self.source_project_summaries.get(project, {})
+            self.dock.source_project_summary_label.setText(
+                self._source_summary_text(project)
+            )
+            self.dock.source_project_summary_label.setToolTip(
+                summary.get("details_tooltip", "")
+            )
+
+            combo_index = self.dock.source_project_combo.findData(project)
+            if combo_index >= 0:
+                self.dock.source_project_combo.blockSignals(True)
+                self.dock.source_project_combo.setCurrentIndex(combo_index)
+                self.dock.source_project_combo.blockSignals(False)
+
+            self.refresh_cache_status()
+            self.update_counts()
+        finally:
+            self._switching_source_project = False
+
+    def source_project_changed(self, *args):
+        if self._switching_source_project or not self.dock:
+            return
+        project = self.dock.source_project_combo.currentData()
+        if project:
+            self._show_source_project(str(project), save_previous=True)
+
+    def _apply_source_project_choices(self, selected_projects):
+        selected_projects = [
+            project
+            for project in selected_projects
+            if project in self.all_source_project_records
+        ]
+        if not selected_projects:
+            return False
+
+        self._save_current_source_state()
+
+        previous_names = dict(self.source_project_terrain_names)
+        previous_selections = dict(self.source_project_selected_files)
+        base_name = self._base_terrain_name_for_source_query()
+        self.source_project_base_terrain_name = base_name
+        self.selected_source_projects = list(selected_projects)
+
+        for project in selected_projects:
+            records = self.all_source_project_records[project]
+            if project not in previous_selections:
+                if self.dock.auto_select_checkbox.isChecked():
+                    self.source_project_selected_files[project] = {
+                        str(item.get("attributes", {}).get("FileName") or "")
+                        for item in records
+                        if str(item.get("attributes", {}).get("FileName") or "")
+                    }
+                else:
+                    self.source_project_selected_files[project] = set()
+
+            if project not in previous_names:
+                self.source_project_terrain_names[project] = (
+                    self._terrain_name_for_source_project(
+                        base_name,
+                        project,
+                    )
+                )
+
+        # Keep state only for source datasets which are part of this AOI query.
+        self.source_project_selected_files = {
+            key: value
+            for key, value in self.source_project_selected_files.items()
+            if key in self.all_source_project_records
+        }
+        self.source_project_terrain_names = {
+            key: value
+            for key, value in self.source_project_terrain_names.items()
+            if key in self.all_source_project_records
+        }
+
+        self._populate_source_project_combo(selected_projects)
+
+        preferred = (
+            self.current_source_project
+            if self.current_source_project in selected_projects
+            else selected_projects[0]
+        )
+        self._show_source_project(preferred, save_previous=False)
+        return True
+
+    def _select_source_projects_dialog(self, preselected=None):
+        summaries = list(self.source_project_summaries.values())
+        dialog = SourceDatasetSelectionDialog(
+            self.iface.mainWindow(),
+            summaries,
+            self._dataset_short_name(),
+            preselected=preselected,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return dialog.selected_projects()
+
+    def choose_source_projects_again(self):
+        if len(self.all_source_project_records) <= 1:
+            return
+
+        selected = self._select_source_projects_dialog(
+            preselected=self.selected_source_projects
+        )
+        if selected is None:
+            return
+
+        self._apply_source_project_choices(selected)
+        self.dock.status_label.setText(
+            f"Selected {len(selected)} independent Ontario "
+            f"{self._dataset_short_name()} source dataset(s)."
+        )
+
+    # --------------------------------------------------------
     # TILE QUERY
     # --------------------------------------------------------
     def find_tiles(self):
@@ -3883,22 +4736,136 @@ class OntarioDTMManagerPlugin:
                     "Use a smaller AOI."
                 )
 
-            self._create_tile_layer(
+            # The live service is queried by AOI bounding box. Apply the true
+            # AOI geometry before source-project discovery so counts in the
+            # chooser represent actual intersecting tile records.
+            intersecting_records = self._records_intersecting_aoi(
                 records,
                 aoi_geometry,
             )
 
-            count = self.tile_layer.featureCount() if self.tile_layer else 0
-
-            if count and self.dock.auto_select_checkbox.isChecked():
-                self.tile_layer.selectAll()
-
-            self.refresh_cache_status()
-            self.update_counts()
+            if not intersecting_records:
+                self._reset_source_project_state(remove_layer=True)
+                self.dock.status_label.setText(
+                    f"No Ontario {short_name} tiles intersect the AOI."
+                )
+                self.update_counts()
+                return
 
             self.dock.status_label.setText(
-                f"Found {count} intersecting Ontario {short_name} tile(s)."
+                f"Inspecting Ontario {short_name} source datasets..."
             )
+            QApplication.processEvents()
+
+            # Deduplicate by source project + FileName before presenting counts.
+            # Overlapping acquisition projects remain separate, but duplicate
+            # index records within one acquisition should not inflate tile totals.
+            grouped_lookup = {}
+            for item in intersecting_records:
+                attributes = item.get("attributes", {})
+                project = str(
+                    attributes.get("Project")
+                    or "Unspecified source project"
+                )
+                filename = str(
+                    attributes.get("FileName")
+                    or attributes.get("TileName")
+                    or id(item)
+                )
+                grouped_lookup.setdefault(project, {})[filename] = item
+
+            grouped = {
+                project: list(file_map.values())
+                for project, file_map in grouped_lookup.items()
+            }
+            deduplicated_records = [
+                item
+                for project_records in grouped.values()
+                for item in project_records
+            ]
+
+            summaries = self._source_project_summaries_from_records(
+                deduplicated_records
+            )
+            if not summaries:
+                raise RuntimeError(
+                    f"Ontario {short_name} tiles were returned, but no source "
+                    "acquisition project could be identified."
+                )
+
+            # Do not disturb the previous map selection until the source
+            # chooser is accepted.
+            selected_projects = [summary["project"] for summary in summaries]
+            if len(summaries) > 1:
+                chooser = SourceDatasetSelectionDialog(
+                    self.iface.mainWindow(),
+                    summaries,
+                    short_name,
+                )
+                if chooser.exec() != QDialog.DialogCode.Accepted:
+                    self.dock.status_label.setText(
+                        "Source-dataset selection cancelled; previous tiles were left unchanged."
+                    )
+                    return
+                selected_projects = chooser.selected_projects()
+
+            base_name = self._base_terrain_name_for_source_query(
+                overlapping=len(summaries) > 1
+            )
+            self._reset_source_project_state(remove_layer=False)
+            self.source_query_aoi_geometry = QgsGeometry(aoi_geometry)
+            self.all_source_project_records = grouped
+            self.source_project_summaries = {
+                summary["project"]: summary
+                for summary in summaries
+            }
+            self.source_query_had_multiple = len(summaries) > 1
+            self.source_project_base_terrain_name = base_name
+            self._write_project_entry(
+                f"sourceBaseTerrainName_{self._selected_dataset_key()}",
+                base_name,
+            )
+
+            # Initialize independent tile selections and terrain names for the
+            # source datasets chosen by the user. Nothing is mixed between
+            # these groups after this point.
+            for project in selected_projects:
+                project_records = grouped.get(project, [])
+                if self.dock.auto_select_checkbox.isChecked():
+                    selected_files = {
+                        str(item.get("attributes", {}).get("FileName") or "")
+                        for item in project_records
+                        if str(item.get("attributes", {}).get("FileName") or "")
+                    }
+                else:
+                    selected_files = set()
+                self.source_project_selected_files[project] = selected_files
+                self.source_project_issue_messages[project] = {}
+                self.source_project_terrain_names[project] = (
+                    self._terrain_name_for_source_project(
+                        base_name,
+                        project,
+                    )
+                )
+
+            self.selected_source_projects = list(selected_projects)
+            self._populate_source_project_combo(selected_projects)
+            self._show_source_project(
+                selected_projects[0],
+                save_previous=False,
+            )
+
+            visible_count = len(grouped.get(selected_projects[0], []))
+            if len(summaries) > 1:
+                self.dock.status_label.setText(
+                    f"Found {len(summaries)} overlapping Ontario {short_name} "
+                    f"source datasets. {len(selected_projects)} selected; "
+                    f"showing {visible_count} tile(s) for {selected_projects[0]}."
+                )
+            else:
+                self.dock.status_label.setText(
+                    f"Found {visible_count} intersecting Ontario {short_name} tile(s)."
+                )
 
             if dataset.get("tile_index_mode") == "zip_shapefile":
                 index_path = self._local_dataset_index_path()
@@ -3911,10 +4878,9 @@ class OntarioDTMManagerPlugin:
                         + os.path.normpath(index_path)
                     )
 
-            if count:
-                self.dock.selection_section.set_expanded(True)
-                self.iface.setActiveLayer(self.tile_layer)
-                self.zoom_to_tiles()
+            self.dock.selection_section.set_expanded(True)
+            self.iface.setActiveLayer(self.tile_layer)
+            self.zoom_to_tiles()
 
         except Exception as exc:
             self.dock.status_label.setText("Tile query failed.")
@@ -3946,23 +4912,35 @@ class OntarioDTMManagerPlugin:
             [
                 QgsField(
                     "TileName",
-                    QVariant.String,
+                    QMetaType.Type.QString,
                 ),
                 QgsField(
                     "FileName",
-                    QVariant.String,
+                    QMetaType.Type.QString,
                 ),
                 QgsField(
                     "Project",
-                    QVariant.String,
+                    QMetaType.Type.QString,
                 ),
                 QgsField(
                     "Package",
-                    QVariant.String,
+                    QMetaType.Type.QString,
                 ),
                 QgsField(
                     "Cached",
-                    QVariant.Int,
+                    QMetaType.Type.Int,
+                ),
+                QgsField(
+                    "PackageIssue",
+                    QMetaType.Type.Int,
+                ),
+                QgsField(
+                    "IssueMessage",
+                    QMetaType.Type.QString,
+                ),
+                QgsField(
+                    "Status",
+                    QMetaType.Type.QString,
                 ),
             ]
         )
@@ -3970,41 +4948,28 @@ class OntarioDTMManagerPlugin:
 
         features = []
 
+        issue_messages = self.source_project_issue_messages.get(
+            self.current_source_project,
+            {},
+        )
+
         for item in records:
             attributes = item.get(
                 "attributes",
                 {},
             )
-            if item.get("qgs_geometry") is not None:
-                geometry = QgsGeometry(item["qgs_geometry"])
-            else:
-                rings = item.get(
-                    "geometry",
-                    {},
-                ).get(
-                    "rings",
-                    [],
-                )
-
-                if not rings:
-                    continue
-
-                points = [
-                    QgsPointXY(
-                        float(x),
-                        float(y),
-                    )
-                    for x, y in rings[0]
-                ]
-
-                geometry = QgsGeometry.fromPolygonXY(
-                    [points]
-                )
+            geometry = self._record_geometry(item)
+            if geometry is None or geometry.isNull() or geometry.isEmpty():
+                continue
 
             if not geometry.intersects(
                 aoi_geometry
             ):
                 continue
+
+            filename = str(attributes.get("FileName") or "")
+            issue_message = issue_messages.get(filename, "")
+            has_issue = 1 if issue_message else 0
 
             feature = QgsFeature(
                 layer.fields()
@@ -4027,6 +4992,9 @@ class OntarioDTMManagerPlugin:
                         "Package"
                     ),
                     0,
+                    has_issue,
+                    issue_message,
+                    "Package issue" if has_issue else "Needs download",
                 ]
             )
             features.append(
@@ -4085,7 +5053,7 @@ class OntarioDTMManagerPlugin:
             layer
         )
         layer.selectionChanged.connect(
-            self.update_counts
+            self._tile_selection_changed
         )
 
         self.tile_layer = layer
@@ -4107,21 +5075,34 @@ class OntarioDTMManagerPlugin:
             }
         )
 
+        issue_symbol = QgsFillSymbol.createSimple(
+            {
+                "color": "220,45,45,80",
+                "outline_color": "190,0,0",
+                "outline_width": "1.5",
+            }
+        )
+
         categories = [
             QgsRendererCategory(
-                1,
+                "Cached",
                 cached_symbol,
                 "Cached",
             ),
             QgsRendererCategory(
-                0,
+                "Needs download",
                 missing_symbol,
                 "Needs download",
+            ),
+            QgsRendererCategory(
+                "Package issue",
+                issue_symbol,
+                "Package issue",
             ),
         ]
 
         renderer = QgsCategorizedSymbolRenderer(
-            "Cached",
+            "Status",
             categories,
         )
         layer.setRenderer(
@@ -4573,7 +5554,7 @@ class OntarioDTMManagerPlugin:
 
             options = self._current_export_option_signature()
             manifest_data = {
-                "plugin_version": "1.0.0",
+                "plugin_version": "1.2.0",
                 "dataset_key": self._selected_dataset_key(),
                 "dataset": self._dataset_short_name(),
                 "terrain_name": self._terrain_layer_name(),
@@ -5515,9 +6496,9 @@ class OntarioDTMManagerPlugin:
             else ""
         )
 
-        cached_index = layer.fields().indexOf(
-            "Cached"
-        )
+        cached_index = layer.fields().indexOf("Cached")
+        issue_index = layer.fields().indexOf("PackageIssue")
+        status_index = layer.fields().indexOf("Status")
 
         if cached_index < 0:
             return
@@ -5525,10 +6506,7 @@ class OntarioDTMManagerPlugin:
         changes = {}
 
         for feature in layer.getFeatures():
-            filename = str(
-                feature["FileName"]
-            )
-
+            filename = str(feature["FileName"])
             is_cached = int(
                 bool(tiles_dir)
                 and os.path.exists(
@@ -5539,15 +6517,29 @@ class OntarioDTMManagerPlugin:
                 )
             )
 
+            has_issue = (
+                issue_index >= 0
+                and int(feature["PackageIssue"] or 0) == 1
+            )
+            status = (
+                str(feature["Status"] or "Tile issue")
+                if has_issue
+                else "Cached"
+                if is_cached
+                else "Needs download"
+            )
+
+            feature_changes = {}
             if int(feature["Cached"] or 0) != is_cached:
-                changes[feature.id()] = {
-                    cached_index: is_cached
-                }
+                feature_changes[cached_index] = is_cached
+            if status_index >= 0 and str(feature["Status"] or "") != status:
+                feature_changes[status_index] = status
+
+            if feature_changes:
+                changes[feature.id()] = feature_changes
 
         if changes:
-            layer.dataProvider().changeAttributeValues(
-                changes
-            )
+            layer.dataProvider().changeAttributeValues(changes)
             layer.triggerRepaint()
 
     # --------------------------------------------------------
@@ -5630,9 +6622,14 @@ class OntarioDTMManagerPlugin:
                 ):
                     cached += 1
 
-        self.dock.available_label.setText(
-            f"Available tiles: {available}"
-        )
+        if self.current_source_project and len(self.selected_source_projects) > 1:
+            self.dock.available_label.setText(
+                f"Available tiles (current source): {available}"
+            )
+        else:
+            self.dock.available_label.setText(
+                f"Available tiles: {available}"
+            )
         self.dock.selected_label.setText(
             f"Selected tiles: {len(selected)}"
         )
@@ -5643,6 +6640,24 @@ class OntarioDTMManagerPlugin:
             f"Need download: "
             f"{max(0, len(selected) - cached)}"
         )
+
+        issue_count = 0
+        if layer and layer.fields().indexOf("PackageIssue") >= 0:
+            issue_count = sum(
+                1
+                for feature in layer.getFeatures()
+                if int(feature["PackageIssue"] or 0) == 1
+            )
+        self.dock.issue_label.setText(
+            f"Tile issues: {issue_count}"
+        )
+        self.dock.issue_label.setVisible(issue_count > 0)
+        if issue_count > 0:
+            self.dock.issue_label.setToolTip(
+                "These tiles have a package-resolution or raster-QA issue. "
+                "They are highlighted red on the map and excluded from the "
+                "current build until the issue is resolved."
+            )
 
         self.refresh_terrain_lifecycle()
 
@@ -5676,6 +6691,369 @@ class OntarioDTMManagerPlugin:
             }
             for feature in selected
         ]
+
+    # --------------------------------------------------------
+    # RASTER QA ISSUES
+    # --------------------------------------------------------
+    def _mark_raster_qa_issues(self, filenames, message):
+        """Highlight source tiles which fail terrain-raster QA and deselect them."""
+        layer = self._current_tile_layer()
+        if not layer or not filenames:
+            return
+
+        target_files = {str(name) for name in filenames}
+        issue_index = layer.fields().indexOf("PackageIssue")
+        message_index = layer.fields().indexOf("IssueMessage")
+        status_index = layer.fields().indexOf("Status")
+        if min(issue_index, message_index, status_index) < 0:
+            return
+
+        changes = {}
+        problem_ids = []
+        for feature in layer.getFeatures():
+            if str(feature["FileName"]) not in target_files:
+                continue
+            problem_ids.append(feature.id())
+            changes[feature.id()] = {
+                issue_index: 1,
+                message_index: str(message),
+                status_index: "Raster QA issue",
+            }
+
+        if changes:
+            layer.dataProvider().changeAttributeValues(changes)
+        if problem_ids:
+            layer.deselect(problem_ids)
+
+        layer.triggerRepaint()
+        self.iface.mapCanvas().refresh()
+        self.update_counts()
+
+    def _terrain_qa_tooltip(self, qa_report):
+        if not qa_report:
+            return ""
+        lines = ["Terrain raster QA passed."]
+        sample_min = qa_report.get("vrt_sample_min")
+        sample_max = qa_report.get("vrt_sample_max")
+        if sample_min is not None and sample_max is not None:
+            lines.append(
+                f"Sampled valid elevation range: {sample_min:.3f} to {sample_max:.3f}."
+            )
+        source_nodata = qa_report.get("source_nodata")
+        source_nodata_values = qa_report.get("source_nodata_values") or []
+        implicit_files = qa_report.get("implicit_nodata_files") or []
+        patched_count = int(qa_report.get("source_nodata_patched_count") or 0)
+        if len(source_nodata_values) > 1:
+            conventions = ", ".join(
+                f"{float(value):.12g}"
+                for value in source_nodata_values[:6]
+            )
+            if len(source_nodata_values) > 6:
+                conventions += ", ..."
+            lines.append(
+                "Source NoData/extreme sentinels observed: "
+                f"{conventions}."
+            )
+        elif source_nodata is not None:
+            lines.append(
+                f"Source NoData observed: {source_nodata:.12g}."
+            )
+        if patched_count:
+            lines.append(
+                f"VRT extreme-value sanitizer applied to {patched_count} raster source(s)."
+            )
+        if implicit_files:
+            lines.append(
+                f"Extreme untagged source sentinel sampled in {len(implicit_files)} tile(s)."
+            )
+        lines.append(
+            f"All values outside the safe raster range are mapped virtually to NoData ({OUTPUT_NODATA:g}); source files are unchanged."
+        )
+        return "\n".join(lines)
+
+    # --------------------------------------------------------
+    # PACKAGE RESOLUTION ISSUES
+    # --------------------------------------------------------
+    def _package_issue_key(self, project_name, package_name):
+        return (
+            self._selected_dataset_key(),
+            str(project_name),
+            str(package_name),
+        )
+
+    def _mark_package_resolution_issues(self, issues):
+        """Mark only tiles belonging to unresolved packages and deselect them."""
+        layer = self._current_tile_layer()
+        if not layer:
+            return
+
+        issue_map = {
+            (str(issue["project"]), str(issue["package"])): {
+                "error": str(issue["error"]),
+                "files": {str(name) for name in issue.get("files", [])},
+            }
+            for issue in issues
+        }
+
+        issue_index = layer.fields().indexOf("PackageIssue")
+        message_index = layer.fields().indexOf("IssueMessage")
+        status_index = layer.fields().indexOf("Status")
+        if min(issue_index, message_index, status_index) < 0:
+            return
+
+        changes = {}
+        problem_ids = []
+
+        for feature in layer.getFeatures():
+            key = (
+                str(feature["Project"]),
+                str(feature["Package"]),
+            )
+            issue_info = issue_map.get(key)
+            if not issue_info:
+                continue
+            if str(feature["FileName"]) not in issue_info["files"]:
+                continue
+
+            problem_ids.append(feature.id())
+            changes[feature.id()] = {
+                issue_index: 1,
+                message_index: issue_info["error"],
+                status_index: "Package issue",
+            }
+
+        if changes:
+            layer.dataProvider().changeAttributeValues(changes)
+
+        # Problem tiles are intentionally deselected so the red issue styling
+        # remains visible instead of being hidden by QGIS selection yellow.
+        if problem_ids:
+            layer.deselect(problem_ids)
+
+        layer.triggerRepaint()
+        self.iface.mapCanvas().refresh()
+        self.update_counts()
+
+    def _clear_package_resolution_issue(
+        self,
+        project_name,
+        package_name,
+        filenames=None,
+        reselect=False,
+    ):
+        layer = self._current_tile_layer()
+        if not layer:
+            return
+
+        issue_index = layer.fields().indexOf("PackageIssue")
+        message_index = layer.fields().indexOf("IssueMessage")
+        status_index = layer.fields().indexOf("Status")
+        cached_index = layer.fields().indexOf("Cached")
+        if min(issue_index, message_index, status_index, cached_index) < 0:
+            return
+
+        target_files = (
+            {str(name) for name in filenames}
+            if filenames is not None
+            else None
+        )
+        changes = {}
+        ids = []
+        for feature in layer.getFeatures():
+            if (
+                str(feature["Project"]) == str(project_name)
+                and str(feature["Package"]) == str(package_name)
+                and (
+                    target_files is None
+                    or str(feature["FileName"]) in target_files
+                )
+            ):
+                ids.append(feature.id())
+                status = (
+                    "Cached"
+                    if int(feature["Cached"] or 0) == 1
+                    else "Needs download"
+                )
+                changes[feature.id()] = {
+                    issue_index: 0,
+                    message_index: "",
+                    status_index: status,
+                }
+
+        if changes:
+            layer.dataProvider().changeAttributeValues(changes)
+        if reselect and ids:
+            layer.select(ids)
+        layer.triggerRepaint()
+        self.iface.mapCanvas().refresh()
+        self.update_counts()
+
+    def _zoom_to_package_issues(self):
+        layer = self._current_tile_layer()
+        if not layer or layer.fields().indexOf("PackageIssue") < 0:
+            return
+
+        geometries = [
+            QgsGeometry(feature.geometry())
+            for feature in layer.getFeatures()
+            if int(feature["PackageIssue"] or 0) == 1
+        ]
+        if not geometries:
+            return
+
+        union = QgsGeometry.unaryUnion(geometries)
+        if union.isNull() or union.isEmpty():
+            return
+
+        extent = union.boundingBox()
+        extent.scale(1.15)
+        self.iface.mapCanvas().setExtent(extent)
+        self.iface.mapCanvas().refresh()
+
+    def _prompt_manual_package_urls(self, issues):
+        """Ask for direct ZIP links for unresolved packages.
+
+        Successfully resolved groups are restored to the current tile selection;
+        unresolved groups stay red and deselected so the next run can proceed
+        with every other valid tile.
+        """
+        applied = 0
+
+        for issue in issues:
+            package_name = str(issue["package"])
+            project_name = str(issue["project"])
+            key = self._package_issue_key(project_name, package_name)
+            existing = self.package_url_overrides.get(key, "")
+
+            prompt = (
+                f"Package: {package_name}\n"
+                f"Project: {project_name}\n"
+                f"Affected selected tiles: {len(issue['files'])}\n\n"
+                "Paste the direct Ontario .zip download URL for this package.\n"
+                "Use the dataset's GeoHub page to locate the package link if needed."
+            )
+
+            while True:
+                url, ok = QInputDialog.getText(
+                    self.iface.mainWindow(),
+                    "Direct Ontario Package URL",
+                    prompt,
+                    QLineEdit.EchoMode.Normal,
+                    existing,
+                )
+
+                if not ok:
+                    break
+
+                url = url.strip()
+                if not url:
+                    break
+
+                try:
+                    # Validate now so the user gets immediate feedback. The
+                    # normal download/build pass will recreate the job.
+                    create_manual_package_job(
+                        issue,
+                        self._selected_dataset_key(),
+                        url,
+                    )
+                except (ValueError, RuntimeError, OSError) as exc:
+                    QMessageBox.warning(
+                        self.iface.mainWindow(),
+                        "Invalid Package URL",
+                        str(exc),
+                    )
+                    existing = url
+                    continue
+
+                self.package_url_overrides[key] = url
+                self._clear_package_resolution_issue(
+                    project_name,
+                    package_name,
+                    filenames=issue.get("files", []),
+                    reselect=True,
+                )
+                applied += 1
+                break
+
+        return applied
+
+    def _handle_package_resolution_issues(self, issues):
+        self._mark_package_resolution_issues(issues)
+
+        details = "\n".join(
+            f"• {issue['package']} — {len(issue['files'])} tile(s)"
+            for issue in issues
+        )
+
+        while True:
+            box = QMessageBox(self.iface.mainWindow())
+            box.setWindowTitle("Ontario Package Download Issue")
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setText(
+                "One or more Ontario source packages could not be resolved automatically."
+            )
+            box.setInformativeText(
+                "Affected tiles have been highlighted red and deselected so they "
+                "cannot accidentally block the rest of the terrain build.\n\n"
+                + details
+                + "\n\nYou can supply a direct Ontario ZIP URL, open the official "
+                  "GeoHub page to find it, or continue with every other selected tile."
+            )
+
+            manual_button = box.addButton(
+                "Enter Direct URL(s)...",
+                QMessageBox.ButtonRole.ActionRole,
+            )
+            geohub_button = box.addButton(
+                "Open GeoHub",
+                QMessageBox.ButtonRole.ActionRole,
+            )
+            zoom_button = box.addButton(
+                "Zoom to Problem Tiles",
+                QMessageBox.ButtonRole.ActionRole,
+            )
+            continue_button = box.addButton(
+                "Continue Without Problem Tiles",
+                QMessageBox.ButtonRole.AcceptRole,
+            )
+            cancel_button = box.addButton(
+                QMessageBox.StandardButton.Cancel
+            )
+
+            box.exec()
+            clicked = box.clickedButton()
+
+            if clicked is geohub_button:
+                self.open_selected_dataset_geohub()
+                continue
+
+            if clicked is zoom_button:
+                self._zoom_to_package_issues()
+                continue
+
+            if clicked is manual_button:
+                applied = self._prompt_manual_package_urls(issues)
+                if applied > 0:
+                    return "retry"
+                continue
+
+            if clicked is continue_button:
+                layer = self._current_tile_layer()
+                if not layer or layer.selectedFeatureCount() == 0:
+                    QMessageBox.information(
+                        self.iface.mainWindow(),
+                        PLUGIN_NAME,
+                        "No unaffected tiles remain selected. Resolve at least one "
+                        "package URL or change the tile selection before continuing.",
+                    )
+                    return "stop"
+                return "retry"
+
+            if clicked is cancel_button:
+                return "stop"
+
+            return "stop"
 
     # --------------------------------------------------------
     # TERRAIN LIFECYCLE / UPDATE ANALYSIS
@@ -6084,7 +7462,215 @@ class OntarioDTMManagerPlugin:
                             layer.id()
                         )
 
+    def _projects_with_selected_tiles(self):
+        self._save_current_source_state()
+
+        if not self.selected_source_projects:
+            return []
+
+        return [
+            project
+            for project in self.selected_source_projects
+            if self.source_project_selected_files.get(project)
+        ]
+
+    def _source_project_vrt_path(self, project):
+        terrain_name = self.source_project_terrain_names.get(
+            project,
+            self._terrain_name_for_source_project(
+                self.source_project_base_terrain_name
+                or self._default_terrain_name(),
+                project,
+            ),
+        )
+        output_folder = self.dock.output_edit.text().strip()
+        if not output_folder:
+            return terrain_name + ".vrt"
+        return os.path.normpath(
+            os.path.join(output_folder, terrain_name + ".vrt")
+        )
+
     def download_and_build(self):
+        """Build the active source dataset, or batch-build independent VRTs.
+
+        When the AOI contains multiple Ontario acquisition projects and the
+        user selected more than one, each source project is processed through
+        the existing single-terrain backend independently. Source tiles are
+        never combined into the same VRT.
+        """
+        # Recursive retries for a package-resolution issue stay within the
+        # currently active batch item rather than starting a second batch.
+        if self._batch_build_state is not None:
+            return self._download_and_build_current_source()
+
+        projects = self._projects_with_selected_tiles()
+
+        # No source-project chooser exists for older sessions; preserve the
+        # established workflow in that case. If source projects are known but
+        # none has selected tiles, give a batch-aware message instead.
+        if not projects:
+            if self.selected_source_projects:
+                QMessageBox.information(
+                    self.iface.mainWindow(),
+                    PLUGIN_NAME,
+                    "No tiles are selected in any chosen source dataset. "
+                    "Select tiles in at least one source dataset before building terrain.",
+                )
+                return
+            return self._download_and_build_current_source()
+
+        if len(projects) == 1:
+            project = projects[0]
+            if project != self.current_source_project:
+                self._show_source_project(project, save_previous=True)
+            return self._download_and_build_current_source()
+
+        lines = []
+        for project in projects:
+            summary = self.source_project_summaries.get(project, {})
+            vrt_path = self._source_project_vrt_path(project)
+            lines.append(
+                f"• {project}\n"
+                f"  {len(self.source_project_selected_files.get(project, set()))} selected tile(s)"
+                f" | {summary.get('year_label', '--')}"
+                f" | {summary.get('resolution_label', '--')}\n"
+                f"  VRT: {vrt_path}"
+            )
+
+        answer = QMessageBox.question(
+            self.iface.mainWindow(),
+            f"Build {len(projects)} Separate Ontario {self._dataset_short_name()} Terrains?",
+            (
+                "Multiple source acquisition datasets are selected. The plugin "
+                "will build/update one independent VRT per source dataset.\n\n"
+                + "\n\n".join(lines)
+                + "\n\nNo source datasets will be mixed into the same VRT. Continue?"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        self._batch_build_state = {
+            "projects": list(projects),
+            "index": 0,
+            "original_project": self.current_source_project,
+            "completed": [],
+            "completed_vrts": [],
+        }
+        self._batch_item_succeeded = False
+        self.dock.source_project_combo.setEnabled(False)
+        self.dock.choose_source_projects_button.setEnabled(False)
+        self._run_next_source_batch_item()
+
+    def _run_next_source_batch_item(self):
+        state = self._batch_build_state
+        if state is None:
+            return
+
+        projects = state["projects"]
+        index = int(state["index"])
+
+        if index >= len(projects):
+            self._finish_source_batch(success=True)
+            return
+
+        project = projects[index]
+        self._show_source_project(project, save_previous=True)
+        self._batch_item_succeeded = False
+
+        self.dock.status_label.setText(
+            f"Building source dataset {index + 1} of {len(projects)}: {project}"
+        )
+        QApplication.processEvents()
+
+        self._download_and_build_current_source()
+
+        # Background downloads advance from _task_finished(). Cached-only
+        # builds complete synchronously and are advanced here.
+        if self.active_task is not None:
+            return
+
+        if self._batch_item_succeeded:
+            self._advance_source_batch_after_success()
+        else:
+            self._finish_source_batch(
+                success=False,
+                message=(
+                    f"Batch terrain build stopped while processing '{project}'. "
+                    "Any source datasets completed earlier remain available."
+                ),
+            )
+
+    def _advance_source_batch_after_success(self, vrt_path=None):
+        state = self._batch_build_state
+        if state is None:
+            return
+
+        index = int(state["index"])
+        projects = state["projects"]
+        if index >= len(projects):
+            return
+
+        project = projects[index]
+        state["completed"].append(project)
+        state["completed_vrts"].append(
+            vrt_path or self._source_project_vrt_path(project)
+        )
+        state["index"] = index + 1
+        self._batch_item_succeeded = False
+
+        QTimer.singleShot(
+            0,
+            self._run_next_source_batch_item,
+        )
+
+    def _finish_source_batch(self, success, message=""):
+        state = self._batch_build_state
+        if state is None:
+            return
+
+        completed = list(state.get("completed", []))
+        completed_vrts = list(state.get("completed_vrts", []))
+        original_project = state.get("original_project", "")
+        self._batch_build_state = None
+        self._batch_item_succeeded = False
+        self.dock.source_project_combo.setEnabled(True)
+        self.dock.choose_source_projects_button.setEnabled(True)
+
+        if original_project in self.selected_source_projects:
+            self._show_source_project(
+                original_project,
+                save_previous=True,
+            )
+
+        if success:
+            details = "\n".join(
+                f"• {project}: {path}"
+                for project, path in zip(completed, completed_vrts)
+            )
+            QMessageBox.information(
+                self.iface.mainWindow(),
+                "Ontario Elevation Batch Complete",
+                (
+                    f"Created/updated {len(completed)} separate "
+                    f"{self._dataset_short_name()} terrain VRT(s).\n\n"
+                    + details
+                ),
+            )
+            self.dock.status_label.setText(
+                f"Batch complete: {len(completed)} separate terrain VRT(s)."
+            )
+        elif message:
+            QMessageBox.warning(
+                self.iface.mainWindow(),
+                "Ontario Elevation Batch Stopped",
+                message,
+            )
+            self.dock.status_label.setText(message)
+
+    def _download_and_build_current_source(self):
         try:
             if self.active_task is not None:
                 with suppress(Exception):
@@ -6229,13 +7815,16 @@ class OntarioDTMManagerPlugin:
                     + f"VRT:\n{final_vrt_path}"
                 )
 
-                answer = QMessageBox.question(
-                    self.iface.mainWindow(),
-                    f"Update Ontario {self._dataset_short_name()} Terrain" if update_mode else f"Build Ontario {self._dataset_short_name()} Terrain",
-                    summary,
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.Yes,
-                )
+                if self._batch_build_state is not None:
+                    answer = QMessageBox.StandardButton.Yes
+                else:
+                    answer = QMessageBox.question(
+                        self.iface.mainWindow(),
+                        f"Update Ontario {self._dataset_short_name()} Terrain" if update_mode else f"Build Ontario {self._dataset_short_name()} Terrain",
+                        summary,
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.Yes,
+                    )
 
                 if answer != QMessageBox.StandardButton.Yes:
                     return
@@ -6255,7 +7844,7 @@ class OntarioDTMManagerPlugin:
                 )
                 QApplication.processEvents()
 
-                build_vrt(
+                qa_report = build_vrt(
                     working_vrt_path,
                     raster_paths,
                 )
@@ -6270,6 +7859,7 @@ class OntarioDTMManagerPlugin:
                 self._load_finished_vrt(
                     final_vrt_path,
                     len(selected_filenames),
+                    qa_report=qa_report,
                 )
 
                 if backup_path:
@@ -6288,10 +7878,24 @@ class OntarioDTMManagerPlugin:
             )
             QApplication.processEvents()
 
-            jobs = resolve_package_jobs(
+            jobs, unresolved_packages = resolve_package_jobs(
                 missing_tiles,
                 self._selected_dataset_key(),
+                manual_urls=self.package_url_overrides,
+                collect_errors=True,
             )
+
+            if unresolved_packages:
+                action = self._handle_package_resolution_issues(
+                    unresolved_packages
+                )
+                if action == "retry":
+                    # Problem groups were either given a manual URL or left
+                    # deselected. Re-enter from the top so terrain lifecycle,
+                    # selected filenames and download totals are recalculated
+                    # consistently for the remaining selection.
+                    return self.download_and_build()
+                return
 
             package_status = []
             remaining_bytes = 0
@@ -6385,13 +7989,16 @@ class OntarioDTMManagerPlugin:
                 + "Start?"
             )
 
-            answer = QMessageBox.question(
-                self.iface.mainWindow(),
-                f"Update Ontario {self._dataset_short_name()} Terrain" if update_mode else f"Ontario {self._dataset_short_name()} Download",
-                summary,
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.Yes,
-            )
+            if self._batch_build_state is not None:
+                answer = QMessageBox.StandardButton.Yes
+            else:
+                answer = QMessageBox.question(
+                    self.iface.mainWindow(),
+                    f"Update Ontario {self._dataset_short_name()} Terrain" if update_mode else f"Ontario {self._dataset_short_name()} Download",
+                    summary,
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
 
             if answer != QMessageBox.StandardButton.Yes:
                 self.dock.status_label.setText("Ready")
@@ -6433,6 +8040,8 @@ class OntarioDTMManagerPlugin:
             self.dock.progress.setValue(0)
             self.dock.build_button.setEnabled(False)
             self.dock.cancel_button.setEnabled(True)
+            self.dock.source_project_combo.setEnabled(False)
+            self.dock.choose_source_projects_button.setEnabled(False)
             self.dock.status_label.setText(
                 "Downloading required tiles in background; current terrain remains unchanged..."
                 if update_mode
@@ -6440,6 +8049,27 @@ class OntarioDTMManagerPlugin:
             )
 
             QgsApplication.taskManager().addTask(task)
+
+        except RasterQAError as exc:
+            self._cleanup_working_vrt(
+                locals().get("working_vrt_path", "")
+            )
+            self._mark_raster_qa_issues(
+                exc.problem_files,
+                str(exc),
+            )
+            self.dock.build_button.setEnabled(True)
+            self.dock.cancel_button.setEnabled(False)
+            self.dock.status_label.setText(
+                "Terrain QA failed. Existing terrain unchanged."
+            )
+            QMessageBox.critical(
+                self.iface.mainWindow(),
+                PLUGIN_NAME,
+                str(exc)
+                + "\n\nThe affected tile(s) were highlighted red and the "
+                "new VRT was rejected before it could replace the terrain.",
+            )
 
         except Exception as exc:
             self.dock.build_button.setEnabled(True)
@@ -6480,6 +8110,9 @@ class OntarioDTMManagerPlugin:
     ):
         self.dock.build_button.setEnabled(True)
         self.dock.cancel_button.setEnabled(False)
+        if self._batch_build_state is None:
+            self.dock.source_project_combo.setEnabled(True)
+            self.dock.choose_source_projects_button.setEnabled(True)
 
         working_vrt_path = task.vrt_path
         final_vrt_path = getattr(
@@ -6506,12 +8139,23 @@ class OntarioDTMManagerPlugin:
             )
             self.active_task = None
             self.refresh_cache_manager()
+            if self._batch_build_state is not None:
+                self._finish_source_batch(
+                    success=False,
+                    message="Batch terrain build cancelled. Any source datasets completed earlier remain available.",
+                )
             return
 
         if not result:
             self._cleanup_working_vrt(
                 working_vrt_path
             )
+            qa_problem_files = list(getattr(task, "qa_problem_files", []) or [])
+            if qa_problem_files:
+                self._mark_raster_qa_issues(
+                    qa_problem_files,
+                    task.error_message or "Raster QA failure",
+                )
             self.dock.status_label.setText(
                 "Download/build failed. Current terrain unchanged."
             )
@@ -6525,6 +8169,11 @@ class OntarioDTMManagerPlugin:
 
             self.active_task = None
             self.refresh_cache_manager()
+            if self._batch_build_state is not None:
+                self._finish_source_batch(
+                    success=False,
+                    message="Batch terrain build stopped because the current source dataset failed. Any source datasets completed earlier remain available.",
+                )
             return
 
         try:
@@ -6538,6 +8187,7 @@ class OntarioDTMManagerPlugin:
             self._load_finished_vrt(
                 final_vrt_path,
                 len(task.selected_filenames),
+                qa_report=getattr(task, "vrt_qa_report", None),
             )
 
             if backup_path:
@@ -6573,21 +8223,43 @@ class OntarioDTMManagerPlugin:
             )
 
         finally:
+            batch_active = self._batch_build_state is not None
+            batch_succeeded = bool(self._batch_item_succeeded)
             self.active_task = None
             self.refresh_cache_status()
             self.update_counts()
             self.refresh_cache_manager()
 
+            if batch_active:
+                if batch_succeeded:
+                    QTimer.singleShot(
+                        0,
+                        lambda path=final_vrt_path: self._advance_source_batch_after_success(path),
+                    )
+                else:
+                    self._finish_source_batch(
+                        success=False,
+                        message=(
+                            "Batch terrain build stopped because the current "
+                            "source dataset could not be committed. Any source "
+                            "datasets completed earlier remain available."
+                        ),
+                    )
+
     def _load_finished_vrt(
         self,
         vrt_path,
         source_count,
+        qa_report=None,
     ):
         if not (
             self.dock.add_to_project_checkbox.isChecked()
         ):
             self.dock.status_label.setText(
                 f"VRT created from {source_count} tile(s): {vrt_path}"
+            )
+            self.dock.status_label.setToolTip(
+                self._terrain_qa_tooltip(qa_report)
             )
             self.iface.messageBar().pushMessage(
                 PLUGIN_NAME,
@@ -6596,6 +8268,8 @@ class OntarioDTMManagerPlugin:
                 duration=8,
             )
             self.refresh_export_status()
+            if self._batch_build_state is not None:
+                self._batch_item_succeeded = True
             return
 
         self._remove_existing_terrain_layer(
@@ -6638,6 +8312,15 @@ class OntarioDTMManagerPlugin:
         )
         raster_layer.triggerRepaint()
 
+        # The tile-index selection fill can obscure the finished terrain. Keep
+        # the selection in memory for lifecycle work, but hide the index layer
+        # after a successful build so the raster is immediately visible.
+        tile_layer = self._current_tile_layer()
+        if tile_layer is not None:
+            tile_node = root.findLayer(tile_layer.id())
+            if tile_node is not None:
+                tile_node.setItemVisibilityChecked(False)
+
         crs_text = (
             raster_layer.crs().authid()
             or raster_layer.crs().description()
@@ -6647,6 +8330,9 @@ class OntarioDTMManagerPlugin:
             f"Ready: {source_count} tile(s), "
             f"{raster_layer.rasterUnitsPerPixelX():g} m pixels, "
             f"CRS {crs_text}, NoData {OUTPUT_NODATA:g}."
+        )
+        self.dock.status_label.setToolTip(
+            self._terrain_qa_tooltip(qa_report)
         )
 
         self.iface.messageBar().pushMessage(
@@ -6659,3 +8345,5 @@ class OntarioDTMManagerPlugin:
             duration=10,
         )
         self.refresh_export_status()
+        if self._batch_build_state is not None:
+            self._batch_item_succeeded = True

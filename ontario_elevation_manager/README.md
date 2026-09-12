@@ -1,6 +1,6 @@
-# Ontario Elevation Manager — v1.0.3
+# Ontario Elevation Manager — v1.2.4
 
-Ontario Elevation Manager is a QGIS 3.44 plugin for working with the native Ontario LiDAR-derived **DTM** and **DSM** products without manually locating dozens of 1 km raster tiles inside large provincial packages.
+Ontario Elevation Manager is a QGIS 3.44+ / QGIS 4.x plugin for working with the native Ontario LiDAR-derived **DTM** and **DSM** products without manually locating dozens of 1 km raster tiles inside large provincial packages.
 
 This is the first stable release of the workflow developed and validated through the 0.x series. It is not an official Government of Ontario or QGIS product.
 
@@ -68,7 +68,7 @@ The interface converts the selected unit to metres before using the existing loc
 
 - native Ontario 1 km bare-earth terrain tiles;
 - live Ontario tile-index and package-index services;
-- `.img` source rasters.
+- legacy `.img` and newer `.tif` / `.tiff` source rasters.
 
 ### LiDAR DSM
 
@@ -78,6 +78,21 @@ The interface converts the selected unit to metres before using the existing loc
 - `.img`, `.tif` and `.tiff` source rasters supported.
 
 DTM and DSM cache data are kept separate while sharing the same user-selected cache root.
+
+## Overlapping LiDAR acquisition datasets
+
+Ontario's DTM and DSM coverage can overlap between independent LiDAR acquisition projects. Version 1.2 detects those overlaps before tile selection.
+
+When more than one source project intersects the AOI, the plugin displays a chooser showing the source project, acquisition year/vintage, resolution (when exposed by Ontario metadata), vertical datum, intersecting tile count, package count and raster format. The newest identifiable source is preselected, but users may choose one or more.
+
+Only one source dataset is displayed for tile editing at a time. If several sources are selected, use the **Source dataset** selector in Section 3 to review and fine-tune each independent tile selection.
+
+When more than one source dataset is built, the plugin creates a separate VRT for each acquisition. Source projects are never mixed into a single VRT. Source-specific names are derived from the terrain name, for example:
+
+- `Oakville_DTM__GTA_Lidar_2014_18.vrt`
+- `Oakville_DTM__GTA_Lidar_2023.vrt`
+
+Newer Ontario DTM projects distributed as TIFF, including GTA 2023, are supported alongside legacy IMG packages.
 
 ## Terrain behavior
 
@@ -124,7 +139,7 @@ Output can retain the native source CRS or use the current QGIS project CRS, wit
 
 1. Open **Plugins > Manage and Install Plugins** in QGIS 3.44.
 2. Choose **Install from ZIP**.
-3. Select `ontario_elevation_manager_v1.0.1.zip`.
+3. Select `ontario_elevation_manager_v1.2.4.zip`.
 4. Enable/open **Ontario Elevation Manager** from the Raster menu or toolbar.
 
 The plugin package folder is `ontario_elevation_manager` so existing installations can be upgraded without changing the QGIS plugin package identity.
@@ -134,3 +149,40 @@ The plugin package folder is `ontario_elevation_manager` so existing installatio
 
 - Added the official plugin icon based on the selected Ontario Tile logo.
 - Fixed Area of Interest radio-button exclusivity so only one AOI source can be selected at a time.
+
+
+## Package-resolution recovery
+
+If Ontario's package index contains a tile/package record but its direct download link is missing, the plugin now tries official Ontario metadata and known archive naming rules before reporting an issue. If a package still cannot be resolved, only the affected tiles are highlighted red and deselected. The user can provide a direct Ontario ZIP URL, open the dataset GeoHub page, zoom to the affected tiles, or continue with the unaffected selected tiles.
+
+
+## Terrain raster QA
+
+Before a working VRT is committed, the plugin validates source raster consistency
+and checks for extreme floating-point sentinel values used as implicit NoData by
+some newer Ontario TIF products. Detected source NoData is normalized to the
+working VRT NoData value (`-9999`). The completed VRT is then reopened and
+post-checked before it is allowed to replace the project terrain.
+
+If QA fails, the existing terrain remains unchanged and affected source tiles are
+marked as tile issues in the current tile layer.
+
+
+### Per-source NoData normalization
+
+Ontario source tiles within one acquisition may use different valid NoData conventions. The plugin records the effective NoData value for each source raster independently and writes that value into the corresponding GDAL VRT source definition. Different source sentinels are therefore normalized to the working VRT NoData value (`-9999`) without altering the downloaded Ontario rasters.
+
+
+## VRT extreme-value sanitizer
+
+Ontario source rasters can contain extreme Float32 sentinel values near the
+limits of the data type. The plugin does not rewrite those source rasters.
+
+Instead, each source in the working VRT receives a GDAL ComplexSource lookup
+table. Values throughout a very broad valid range are passed through unchanged,
+while extreme sentinel values are mapped virtually to the working NoData value
+(-9999). This works even when positive and negative sentinel conventions occur
+within the same acquisition or source tile.
+
+The completed VRT is validated before it replaces an existing terrain, and the
+plugin computes post-sanitization statistics for a useful QGIS display stretch.

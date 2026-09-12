@@ -25,10 +25,19 @@ RASTER_DATASETS = {
             "Ontario_DTM_Lidar_Derived_Package_Index/FeatureServer/1"
         ),
         "cache_subdir": "",
-        "extensions": (".img",),
+        # Legacy Ontario DTM packages use IMG while newer projects, including
+        # GTA 2023, are distributed as TIFF.
+        "extensions": (".img", ".tif", ".tiff"),
         "index_zip_url": None,
-        "metadata_url": None,
-        "package_base_url": None,
+        "metadata_url": (
+            "https://www.arcgis.com/sharing/rest/content/items/"
+            "776819a7a0de42f3b75e40527cc36a0a/info/metadata/metadata.xml"
+            "?format=default&output=html"
+        ),
+        "package_base_url": (
+            "https://ws.gisetl.lrc.gov.on.ca/"
+            "fmedatadownload/Packages/"
+        ),
     },
     "lidar_dsm": {
         "name": "LiDAR DSM (surface model)",
